@@ -6,11 +6,11 @@ It is intentionally minimal and **has no authentication and no encryption**. Rea
 
 ## Components
 
-- `for_windows.py`
+- `Powershell-MCP/for_windows.py`
   - Runs on Windows.
   - Listens on a TCP port and executes incoming PowerShell commands.
   - Protocol: newline-delimited JSON request/response.
-- `linux_mcp_powershell_bridge.py`
+- `Powershell-MCP/linux_mcp_powershell_bridge.py`
   - Runs on Linux/WSL.
   - Implements an MCP tool server with one tool: `powershell`.
   - Forwards tool calls to the Windows listener over TCP.
@@ -30,7 +30,7 @@ It is intentionally minimal and **has no authentication and no encryption**. Rea
 Run on Windows in a terminal:
 
 ```powershell
-python for_windows.py --host 127.0.0.1 --port 8765
+python Powershell-MCP\\for_windows.py --host 127.0.0.1 --port 8765
 ```
 
 Notes:
@@ -48,15 +48,10 @@ Optional environment variables (Windows):
 Run on Linux/WSL:
 
 ```bash
-python3 linux_mcp_powershell_bridge.py
+python3 Powershell-MCP/linux_mcp_powershell_bridge.py --host <WINDOWS_LISTENER_IP> --port 8765
 ```
 
-Optional environment variables (Linux/WSL):
-
-- `PS_LISTEN_HOST`: hostname/IP for the Windows listener (overrides auto-detection)
-- `PS_LISTEN_PORT`: port for the Windows listener (default `8765`)
-
-`linux_mcp_powershell_bridge.py` will try to find the Windows host automatically. In WSL, it typically uses the `nameserver` value from `/etc/resolv.conf`, then falls back to a small list of common vEthernet IPs plus `localhost`.
+`linux_mcp_powershell_bridge.py` does not do any host auto-detection. You must provide the Windows listener host/IP and port.
 
 ### 3) Use it from an MCP client
 
@@ -108,7 +103,7 @@ This project is a remote command execution bridge.
 Minimum safe operating guidance:
 
 1. Bind the Windows listener to localhost only:
-   - `python for_windows.py --host 127.0.0.1 --port 8765`
+   - `python Powershell-MCP\\for_windows.py --host 127.0.0.1 --port 8765`
 2. If you must bind to a LAN IP:
    - Use Windows Firewall to restrict inbound connections to a specific trusted source.
    - Never expose the port to the public internet.
@@ -116,5 +111,4 @@ Minimum safe operating guidance:
 
 ## Project Notes
 
-- The `Powershell-MCP/` folder exists in this repo and may contain related upstream/project material, but the functional bridge is implemented by the two Python files in the repo root.
-
+- The functional bridge is implemented by `Powershell-MCP/for_windows.py` and `Powershell-MCP/linux_mcp_powershell_bridge.py`.

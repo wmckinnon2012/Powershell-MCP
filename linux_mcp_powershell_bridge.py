@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
+import argparse
 import json
-import os
 import socket
 import sys
 import time
@@ -47,52 +47,20 @@ def _text_result(msg_id: Any, text: str, is_error: bool = False, framing: str = 
     )
 
 
-def _connect(hosts: list, port: int) -> socket.socket:
+def _connect(host: str, port: int) -> socket.socket:
     while True:
-        for host in hosts:
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(2.0)
+            sock.connect((host, port))
+            sock.settimeout(None)
+            return sock
+        except OSError:
             try:
-                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.settimeout(2.0)
-                sock.connect((host, port))
-                sock.settimeout(None)
-                return sock
-            except OSError:
-                try:
-                    sock.close()
-                except Exception:
-                    pass
-                continue
+                sock.close()
+            except Exception:
+                pass
         time.sleep(1.0)
-
-
-def _default_hosts() -> list:
-    hosts = []
-    env_host = os.environ.get("PS_LISTEN_HOST")
-    if env_host:
-        hosts.append(env_host)
-
-    # In WSL, Windows host IP is usually the nameserver.
-    try:
-        with open("/etc/resolv.conf", "r", encoding="utf-8") as f:
-            for line in f:
-                if line.startswith("nameserver"):
-                    parts = line.split()
-                    if len(parts) >= 2:
-                        hosts.append(parts[1])
-                        break
-    except OSError:
-        pass
-
-    # Common WSL vEthernet defaults.
-    hosts.extend(["172.26.64.1", "172.27.48.1", "localhost"])
-    # De-dupe while preserving order.
-    seen = set()
-    ordered = []
-    for h in hosts:
-        if h not in seen:
-            seen.add(h)
-            ordered.append(h)
-    return ordered
 
 
 def _send_command(
@@ -176,8 +144,24 @@ def _read_message() -> Tuple[Optional[Dict[str, Any]], str]:
 
 
 def main() -> None:
-    hosts = _default_hosts()
-    port = int(os.environ.get("PS_LISTEN_PORT", "8765"))
+    parser = argparse.ArgumentParser(
+        description="MCP tool server that forwards PowerShell commands to a Windows TCP listener."
+    )
+    parser.add_argument(
+        "--host",
+        required=True,
+        help="Windows listener host/IP to connect to.",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        required=True,
+        help="Windows listener TCP port to connect to.",
+    )
+    args = parser.parse_args()
+
+    host = args.host
+    port = args.port
 
     sock: Optional[socket.socket] = None
 
@@ -238,7 +222,7 @@ def main() -> None:
                 continue
 
             if sock is None:
-                sock = _connect(hosts, port)
+                sock = _connect(host, port)
 
             try:
                 result = _send_command(sock, command)
@@ -247,7 +231,7 @@ def main() -> None:
                     sock.close()
                 except Exception:
                     pass
-                sock = _connect(hosts, port)
+                sock = _connect(host, port)
                 result = _send_command(sock, command)
 
             stdout = (result.get("stdout") or "").rstrip("\n")
