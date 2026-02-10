@@ -1,0 +1,2 @@
+# Powershell-MCP
+PowerShellMCP-Extender
