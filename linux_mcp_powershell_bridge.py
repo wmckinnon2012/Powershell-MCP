@@ -4,7 +4,7 @@ import json
 import socket
 import sys
 import time
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 
 def _write_message(message: Dict[str, Any], framing: str) -> None:
@@ -63,17 +63,75 @@ def _connect(host: str, port: int) -> socket.socket:
         time.sleep(1.0)
 
 
-def _send_command(
-    sock: socket.socket, command: str
-) -> Dict[str, Any]:
-    payload = json.dumps({"command": command}, ensure_ascii=True) + "\n"
-    sock.sendall(payload.encode("utf-8"))
+def _send_request(sock: socket.socket, payload: Dict[str, Any]) -> Dict[str, Any]:
+    encoded = json.dumps(payload, ensure_ascii=True) + "\n"
+    sock.sendall(encoded.encode("utf-8"))
 
     with sock.makefile("r", encoding="utf-8", newline="") as reader:
         line = reader.readline()
         if not line:
             raise ConnectionError("Windows listener disconnected")
         return json.loads(line)
+
+
+def _extract_commands(arguments: Dict[str, Any]) -> Optional[List[str]]:
+    command = arguments.get("command")
+    commands = arguments.get("commands")
+
+    if isinstance(command, str):
+        return [command]
+
+    if isinstance(commands, list) and commands:
+        extracted = []
+        for item in commands:
+            if not isinstance(item, str):
+                return None
+            extracted.append(item)
+        return extracted
+
+    return None
+
+
+def _format_execution_text(result: Dict[str, Any]) -> str:
+    status = str(result.get("status", "unknown"))
+    command_count = result.get("command_count")
+    header = f"status: {status}"
+    if isinstance(command_count, int):
+        header += f", commands: {command_count}"
+
+    stdout = (result.get("stdout") or "").rstrip("\n")
+    stderr = (result.get("stderr") or "").rstrip("\n")
+    sections = [header]
+    if stdout:
+        sections.append(stdout)
+    if stderr:
+        sections.append("[stderr]\n" + stderr)
+    if len(sections) == 1:
+        sections.append("(no output)")
+    return "\n".join(sections)
+
+
+def _format_status_text(result: Dict[str, Any]) -> str:
+    status = str(result.get("status", "unknown"))
+    job_id = result.get("job_id") or "(unknown)"
+    lines = [f"job_id: {job_id}", f"status: {status}"]
+
+    if isinstance(result.get("command_count"), int):
+        lines.append(f"commands: {result['command_count']}")
+    if isinstance(result.get("started_at"), str):
+        lines.append(f"started_at: {result['started_at']}")
+    if isinstance(result.get("finished_at"), str):
+        lines.append(f"finished_at: {result['finished_at']}")
+    if isinstance(result.get("elapsed_seconds"), (int, float)):
+        lines.append(f"elapsed_seconds: {result['elapsed_seconds']:.1f}")
+
+    inner = result.get("result")
+    if isinstance(inner, dict):
+        lines.append(_format_execution_text(inner))
+    elif result.get("stderr"):
+        lines.append("[stderr]\n" + str(result.get("stderr")))
+
+    return "\n".join(lines)
 
 
 def _handle_tools_list(msg_id: Any, framing: str) -> None:
@@ -85,19 +143,43 @@ def _handle_tools_list(msg_id: Any, framing: str) -> None:
                 "tools": [
                     {
                         "name": "powershell",
-                        "description": "Run a Windows PowerShell command via network bridge.",
+                        "description": "Run one or more Windows PowerShell commands via network bridge.",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
                                 "command": {
                                     "type": "string",
-                                    "description": "PowerShell command to execute.",
+                                    "description": "Single PowerShell command to execute.",
+                                },
+                                "commands": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                    "minItems": 1,
+                                    "description": "List of PowerShell commands to run in order.",
+                                },
+                                "async": {
+                                    "type": "boolean",
+                                    "description": "If true, return immediately with job_id for status polling.",
                                 }
                             },
-                            "required": ["command"],
                             "additionalProperties": False,
                         },
-                    }
+                    },
+                    {
+                        "name": "powershell_status",
+                        "description": "Get status/output for a long-running PowerShell job.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "job_id": {
+                                    "type": "string",
+                                    "description": "Job ID returned by async powershell call.",
+                                }
+                            },
+                            "required": ["job_id"],
+                            "additionalProperties": False,
+                        },
+                    },
                 ]
             },
         },
@@ -210,41 +292,75 @@ def main() -> None:
             name = params.get("name")
             arguments = params.get("arguments") or {}
 
-            if name != "powershell":
-                _error_response(msg_id, -32601, "Tool not found", framing_mode)
+            if name == "powershell":
+                commands = _extract_commands(arguments)
+                if commands is None:
+                    _error_response(
+                        msg_id,
+                        -32602,
+                        "Provide 'command' string or non-empty 'commands' array of strings",
+                        framing_mode,
+                    )
+                    continue
+
+                async_mode = bool(arguments.get("async", False))
+                payload: Dict[str, Any] = {"action": "run", "async": async_mode}
+                if len(commands) == 1:
+                    payload["command"] = commands[0]
+                else:
+                    payload["commands"] = commands
+
+                if sock is None:
+                    sock = _connect(host, port)
+
+                try:
+                    result = _send_request(sock, payload)
+                except Exception:
+                    try:
+                        sock.close()
+                    except Exception:
+                        pass
+                    sock = _connect(host, port)
+                    result = _send_request(sock, payload)
+
+                if async_mode:
+                    status = str(result.get("status", "unknown"))
+                    job_id = result.get("job_id") or "(unknown)"
+                    text = f"status: {status}\njob_id: {job_id}"
+                else:
+                    text = _format_execution_text(result)
+                _text_result(msg_id, text, is_error=not bool(result.get("ok")), framing=framing_mode)
                 continue
 
-            command = arguments.get("command")
-            if not isinstance(command, str):
-                _error_response(
-                    msg_id, -32602, "Missing or invalid 'command'", framing_mode
+            if name == "powershell_status":
+                job_id = arguments.get("job_id")
+                if not isinstance(job_id, str) or not job_id:
+                    _error_response(msg_id, -32602, "Missing or invalid 'job_id'", framing_mode)
+                    continue
+
+                payload = {"action": "status", "job_id": job_id}
+                if sock is None:
+                    sock = _connect(host, port)
+
+                try:
+                    result = _send_request(sock, payload)
+                except Exception:
+                    try:
+                        sock.close()
+                    except Exception:
+                        pass
+                    sock = _connect(host, port)
+                    result = _send_request(sock, payload)
+
+                _text_result(
+                    msg_id,
+                    _format_status_text(result),
+                    is_error=not bool(result.get("ok")),
+                    framing=framing_mode,
                 )
                 continue
 
-            if sock is None:
-                sock = _connect(host, port)
-
-            try:
-                result = _send_command(sock, command)
-            except Exception:
-                try:
-                    sock.close()
-                except Exception:
-                    pass
-                sock = _connect(host, port)
-                result = _send_command(sock, command)
-
-            stdout = (result.get("stdout") or "").rstrip("\n")
-            stderr = (result.get("stderr") or "").rstrip("\n")
-            ok = bool(result.get("ok"))
-
-            text = stdout
-            if stderr:
-                text = (stdout + "\n" if stdout else "") + "[stderr]\n" + stderr
-            if text == "":
-                text = "(no output)"
-
-            _text_result(msg_id, text, is_error=not ok, framing=framing_mode)
+            _error_response(msg_id, -32601, "Tool not found", framing_mode)
             continue
 
         if method is None:

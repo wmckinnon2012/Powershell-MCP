@@ -12,7 +12,7 @@ It is intentionally minimal and **has no authentication and no encryption**. Rea
   - Protocol: newline-delimited JSON request/response.
 - `Powershell-MCP/linux_mcp_powershell_bridge.py`
   - Runs on Linux/WSL.
-  - Implements an MCP tool server with one tool: `powershell`.
+  - Implements an MCP tool server with tools: `powershell`, `powershell_status`.
   - Forwards tool calls to the Windows listener over TCP.
 
 ## Requirements
@@ -55,10 +55,14 @@ python3 Powershell-MCP/linux_mcp_powershell_bridge.py --host <WINDOWS_LISTENER_I
 
 ### 3) Use it from an MCP client
 
-The bridge exposes one tool:
+The bridge exposes these tools:
 
-- Tool name: `powershell`
-- Input: `{ "command": "..." }`
+- `powershell`
+  - Run one command (`command`) or multiple commands (`commands`).
+  - Optional `async: true` returns immediately with a `job_id`.
+- `powershell_status`
+  - Input: `{ "job_id": "..." }`
+  - Returns `running/completed/failed` and output once available.
 
 Example PowerShell command:
 
@@ -73,18 +77,49 @@ How you configure an MCP client to launch this server depends on the client. The
 
 ## Testing Without MCP (direct TCP protocol)
 
-The Windows listener accepts a single-line JSON object like:
+The Windows listener accepts single-line JSON objects.
+
+Run one command (sync):
 
 ```json
 {"command":"Write-Output 'hello from powershell'"}
 ```
 
-and replies with a single-line JSON object containing:
+Run multiple commands (sync):
+
+```json
+{"action":"run","commands":["Write-Output 'one'","Write-Output 'two'"]}
+```
+
+Run async:
+
+```json
+{"action":"run","command":"Start-Sleep -Seconds 10; Write-Output 'done'","async":true}
+```
+
+Check async status:
+
+```json
+{"action":"status","job_id":"<job-id>"}
+```
+
+Sync replies include:
 
 - `ok` (boolean)
 - `stdout` (string)
 - `stderr` (string)
 - `code` (int process exit code)
+- `status` (`completed` or `failed`)
+- `results` (per-command results for batch mode)
+
+Async status replies include:
+
+- `ok` (boolean)
+- `status` (`running`, `completed`, `failed`, `not_found`)
+- `job_id`
+- `started_at`, `finished_at` (UTC ISO timestamp)
+- `elapsed_seconds` while running
+- `result` when completed/failed
 
 ## Security / Risks (read before running)
 

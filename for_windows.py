@@ -1,11 +1,18 @@
 #!/usr/bin/env python3
 import argparse
+from datetime import datetime, timezone
 import json
 import os
 import socket
 import subprocess
 import sys
-from typing import Any, Dict
+import threading
+import uuid
+from typing import Any, Dict, List, Optional
+
+
+_jobs: Dict[str, Dict[str, Any]] = {}
+_jobs_lock = threading.Lock()
 
 
 def _write_line(sock: socket.socket, obj: Dict[str, Any]) -> None:
@@ -20,7 +27,11 @@ def _read_line(sock_file) -> Dict[str, Any]:
     return json.loads(line)
 
 
-def _run_powershell(command: str) -> Dict[str, Any]:
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _run_single_powershell(command: str) -> Dict[str, Any]:
     pwsh = os.environ.get("POWERSHELL_EXE")
     candidates = []
     if pwsh:
@@ -59,25 +70,182 @@ def _run_powershell(command: str) -> Dict[str, Any]:
         }
 
 
+def _run_powershell_batch(commands: List[str]) -> Dict[str, Any]:
+    results: List[Dict[str, Any]] = []
+    for idx, command in enumerate(commands):
+        result = _run_single_powershell(command)
+        result["index"] = idx
+        results.append(result)
+
+    ok = all(bool(item.get("ok")) for item in results)
+    code = 0
+    for item in results:
+        item_code = item.get("code")
+        if isinstance(item_code, int) and item_code != 0:
+            code = item_code
+            break
+
+    if len(results) == 1:
+        first = results[0]
+        return {
+            "ok": ok,
+            "stdout": first.get("stdout", ""),
+            "stderr": first.get("stderr", ""),
+            "code": int(first.get("code", code)),
+            "results": results,
+        }
+
+    stdout_parts: List[str] = []
+    stderr_parts: List[str] = []
+    for item in results:
+        idx = int(item.get("index", 0))
+        out = item.get("stdout", "")
+        err = item.get("stderr", "")
+        if out:
+            stdout_parts.append(f"[command {idx} stdout]\n{out.rstrip()}")
+        if err:
+            stderr_parts.append(f"[command {idx} stderr]\n{err.rstrip()}")
+
+    return {
+        "ok": ok,
+        "stdout": "\n\n".join(stdout_parts) + ("\n" if stdout_parts else ""),
+        "stderr": "\n\n".join(stderr_parts) + ("\n" if stderr_parts else ""),
+        "code": code,
+        "results": results,
+    }
+
+
+def _extract_commands(msg: Dict[str, Any]) -> Optional[List[str]]:
+    command = msg.get("command")
+    commands = msg.get("commands")
+
+    if isinstance(command, str):
+        return [command]
+
+    if isinstance(commands, list) and commands:
+        extracted = []
+        for item in commands:
+            if not isinstance(item, str):
+                return None
+            extracted.append(item)
+        return extracted
+
+    return None
+
+
+def _status_from_job(job: Dict[str, Any]) -> Dict[str, Any]:
+    status = str(job.get("status", "running"))
+    started_at = str(job.get("started_at", ""))
+    finished_at = job.get("finished_at")
+
+    response = {
+        "ok": status != "failed",
+        "status": status,
+        "job_id": job["job_id"],
+        "started_at": started_at,
+        "finished_at": finished_at,
+        "command_count": int(job.get("command_count", 0)),
+    }
+
+    if status == "running":
+        elapsed_seconds = max(0.0, datetime.now(timezone.utc).timestamp() - float(job.get("start_ts", 0.0)))
+        response["elapsed_seconds"] = elapsed_seconds
+        return response
+
+    response["result"] = job.get("result") or {}
+    return response
+
+
+def _run_job(job_id: str, commands: List[str]) -> None:
+    result = _run_powershell_batch(commands)
+    finished_at = _now_iso()
+    status = "completed" if bool(result.get("ok")) else "failed"
+    with _jobs_lock:
+        if job_id in _jobs:
+            _jobs[job_id]["status"] = status
+            _jobs[job_id]["finished_at"] = finished_at
+            _jobs[job_id]["result"] = result
+
+
+def _start_async_job(commands: List[str]) -> Dict[str, Any]:
+    job_id = str(uuid.uuid4())
+    started_at = _now_iso()
+    job = {
+        "job_id": job_id,
+        "status": "running",
+        "started_at": started_at,
+        "start_ts": datetime.now(timezone.utc).timestamp(),
+        "finished_at": None,
+        "command_count": len(commands),
+        "result": None,
+    }
+    with _jobs_lock:
+        _jobs[job_id] = job
+
+    thread = threading.Thread(target=_run_job, args=(job_id, commands), daemon=True)
+    thread.start()
+
+    return {
+        "ok": True,
+        "status": "running",
+        "job_id": job_id,
+        "started_at": started_at,
+        "finished_at": None,
+        "command_count": len(commands),
+    }
+
+
+def _handle_request(msg: Dict[str, Any]) -> Dict[str, Any]:
+    action = msg.get("action")
+
+    if action == "status":
+        job_id = msg.get("job_id")
+        if not isinstance(job_id, str) or not job_id:
+            return {
+                "ok": False,
+                "status": "invalid",
+                "stderr": "Missing or invalid 'job_id'",
+                "code": 2,
+            }
+        with _jobs_lock:
+            job = _jobs.get(job_id)
+            if job is None:
+                return {
+                    "ok": False,
+                    "status": "not_found",
+                    "stderr": f"Unknown job_id '{job_id}'",
+                    "code": 3,
+                }
+            return _status_from_job(job)
+
+    commands = _extract_commands(msg)
+    if commands is None:
+        return {
+            "ok": False,
+            "status": "invalid",
+            "stdout": "",
+            "stderr": "Missing or invalid 'command'/'commands'",
+            "code": 2,
+        }
+
+    async_mode = bool(msg.get("async", False))
+    if async_mode:
+        return _start_async_job(commands)
+
+    result = _run_powershell_batch(commands)
+    return {
+        **result,
+        "status": "completed" if bool(result.get("ok")) else "failed",
+        "command_count": len(commands),
+    }
+
+
 def _handle_client(conn: socket.socket) -> None:
     with conn:
         conn_file = conn.makefile("r", encoding="utf-8", newline="")
         while True:
             msg = _read_line(conn_file)
-            command = msg.get("command")
-            if not isinstance(command, str):
-                _write_line(
-                    conn,
-                    {
-                        "ok": False,
-                        "stdout": "",
-                        "stderr": "Missing or invalid 'command'",
-                        "code": 2,
-                    },
-                )
-                continue
-
-            result = _run_powershell(command)
+            result = _handle_request(msg)
             _write_line(conn, result)
 
 
