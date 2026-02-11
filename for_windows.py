@@ -15,6 +15,18 @@ _jobs: Dict[str, Dict[str, Any]] = {}
 _jobs_lock = threading.Lock()
 
 
+def _log(message: str) -> None:
+    sys.stderr.write(f"[listener] {message}\n")
+    sys.stderr.flush()
+
+
+def _preview_command(command: str, limit: int = 160) -> str:
+    one_line = " ".join(command.splitlines()).strip()
+    if len(one_line) <= limit:
+        return one_line
+    return one_line[: limit - 3] + "..."
+
+
 def _write_line(sock: socket.socket, obj: Dict[str, Any]) -> None:
     data = json.dumps(obj, ensure_ascii=True).encode("utf-8") + b"\n"
     sock.sendall(data)
@@ -32,6 +44,7 @@ def _now_iso() -> str:
 
 
 def _run_single_powershell(command: str) -> Dict[str, Any]:
+    _log(f"run command: {_preview_command(command)}")
     pwsh = os.environ.get("POWERSHELL_EXE")
     candidates = []
     if pwsh:
@@ -45,6 +58,9 @@ def _run_single_powershell(command: str) -> Dict[str, Any]:
                     [exe, "-NoProfile", "-NonInteractive", "-Command", command],
                     capture_output=True,
                     text=True,
+                )
+                _log(
+                    f"command finished: code={proc.returncode}, stdout={len(proc.stdout or '')} bytes, stderr={len(proc.stderr or '')} bytes"
                 )
                 return {
                     "ok": proc.returncode == 0,
@@ -71,6 +87,7 @@ def _run_single_powershell(command: str) -> Dict[str, Any]:
 
 
 def _run_powershell_batch(commands: List[str]) -> Dict[str, Any]:
+    _log(f"batch start: {len(commands)} command(s)")
     results: List[Dict[str, Any]] = []
     for idx, command in enumerate(commands):
         result = _run_single_powershell(command)
@@ -157,6 +174,7 @@ def _status_from_job(job: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _run_job(job_id: str, commands: List[str]) -> None:
+    _log(f"job {job_id} started ({len(commands)} command(s))")
     result = _run_powershell_batch(commands)
     finished_at = _now_iso()
     status = "completed" if bool(result.get("ok")) else "failed"
@@ -165,6 +183,7 @@ def _run_job(job_id: str, commands: List[str]) -> None:
             _jobs[job_id]["status"] = status
             _jobs[job_id]["finished_at"] = finished_at
             _jobs[job_id]["result"] = result
+    _log(f"job {job_id} finished with status={status}")
 
 
 def _start_async_job(commands: List[str]) -> Dict[str, Any]:
@@ -184,6 +203,7 @@ def _start_async_job(commands: List[str]) -> Dict[str, Any]:
 
     thread = threading.Thread(target=_run_job, args=(job_id, commands), daemon=True)
     thread.start()
+    _log(f"job {job_id} queued ({len(commands)} command(s))")
 
     return {
         "ok": True,
@@ -197,6 +217,7 @@ def _start_async_job(commands: List[str]) -> Dict[str, Any]:
 
 def _handle_request(msg: Dict[str, Any]) -> Dict[str, Any]:
     action = msg.get("action")
+    _log(f"request received: action={action or 'run(default)'} keys={sorted(msg.keys())}")
 
     if action == "status":
         job_id = msg.get("job_id")
@@ -210,13 +231,16 @@ def _handle_request(msg: Dict[str, Any]) -> Dict[str, Any]:
         with _jobs_lock:
             job = _jobs.get(job_id)
             if job is None:
+                _log(f"status check: job {job_id} not found")
                 return {
                     "ok": False,
                     "status": "not_found",
                     "stderr": f"Unknown job_id '{job_id}'",
                     "code": 3,
                 }
-            return _status_from_job(job)
+            response = _status_from_job(job)
+            _log(f"status check: job {job_id} -> {response.get('status')}")
+            return response
 
     commands = _extract_commands(msg)
     if commands is None:
@@ -233,6 +257,7 @@ def _handle_request(msg: Dict[str, Any]) -> Dict[str, Any]:
         return _start_async_job(commands)
 
     result = _run_powershell_batch(commands)
+    _log(f"sync run finished: status={'completed' if bool(result.get('ok')) else 'failed'}")
     return {
         **result,
         "status": "completed" if bool(result.get("ok")) else "failed",
@@ -241,12 +266,15 @@ def _handle_request(msg: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _handle_client(conn: socket.socket) -> None:
+    peer = conn.getpeername()
+    _log(f"client connected: {peer[0]}:{peer[1]}")
     with conn:
         conn_file = conn.makefile("r", encoding="utf-8", newline="")
         while True:
             msg = _read_line(conn_file)
             result = _handle_request(msg)
             _write_line(conn, result)
+            _log(f"response sent: ok={result.get('ok')} status={result.get('status')}")
 
 
 def main() -> None:
