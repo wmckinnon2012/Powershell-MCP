@@ -265,13 +265,35 @@ def _handle_request(msg: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _handle_client(conn: socket.socket) -> None:
-    peer = conn.getpeername()
-    _log(f"client connected: {peer[0]}:{peer[1]}")
+def _handle_client(conn: socket.socket, idle_timeout_seconds: float) -> None:
+    try:
+        peer = conn.getpeername()
+        _log(f"client connected: {peer[0]}:{peer[1]}")
+    except Exception:
+        _log("client connected: <unknown-peer>")
+
+    conn.settimeout(idle_timeout_seconds)
     with conn:
         conn_file = conn.makefile("r", encoding="utf-8", newline="")
         while True:
-            msg = _read_line(conn_file)
+            try:
+                msg = _read_line(conn_file)
+            except socket.timeout:
+                _log(f"client idle timeout after {int(idle_timeout_seconds)}s; closing connection")
+                break
+            except ConnectionError:
+                _log("client disconnected")
+                break
+            except json.JSONDecodeError as exc:
+                _log(f"invalid JSON from client: {exc}")
+                break
+            except Exception as exc:
+                if "timed out" in str(exc).lower():
+                    _log(f"client idle timeout after {int(idle_timeout_seconds)}s; closing connection")
+                    break
+                _log(f"client read error: {exc}")
+                break
+
             result = _handle_request(msg)
             _write_line(conn, result)
             _log(f"response sent: ok={result.get('ok')} status={result.get('status')}")
@@ -292,23 +314,30 @@ def main() -> None:
         default=int(os.environ.get("PS_LISTEN_PORT", "8765")),
         help="TCP port to bind (default: 8765).",
     )
+    parser.add_argument(
+        "--client-idle-timeout",
+        type=float,
+        default=float(os.environ.get("PS_CLIENT_IDLE_TIMEOUT", "300")),
+        help="Seconds before an idle client connection is closed (default: 300).",
+    )
     args = parser.parse_args()
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind((args.host, args.port))
-    sock.listen(1)
+    sock.listen(16)
 
     sys.stderr.write(f"PowerShell listener on {args.host}:{args.port}\n")
     sys.stderr.flush()
 
     while True:
         conn, _addr = sock.accept()
-        try:
-            _handle_client(conn)
-        except Exception as exc:
-            sys.stderr.write(f"Client error: {exc}\n")
-            sys.stderr.flush()
+        thread = threading.Thread(
+            target=_handle_client,
+            args=(conn, args.client_idle_timeout),
+            daemon=True,
+        )
+        thread.start()
 
 
 if __name__ == "__main__":
